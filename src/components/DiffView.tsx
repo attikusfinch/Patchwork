@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { forwardRef, memo, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { ChevronsUpDown, FileCode2, MessageSquarePlus, SearchX } from 'lucide-react';
 import { collapseRows, linesFor, splitRows } from '../diff';
 import type { DiffLine, DisplayRow, SplitRow } from '../diff';
@@ -28,7 +28,7 @@ function marked(value: string, query: string) {
   return parts;
 }
 
-function Syntax({value, search}: {value: string; search: string}) {
+const Syntax=memo(function Syntax({value, search}: {value: string; search: string}) {
   if(value.length>4000)return <>{marked(value,search)}</>;
   const tokens = value.split(/(\/\/.*$|#.*$|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`[^`]*`|\b(?:import|from|const|let|var|export|async|await|return|function|if|else|throw|new|class|interface|type|pub|fn|use|struct|impl|match|mod|for|in|while|try|catch|true|false|null|undefined|as)\b|\b\d+(?:\.\d+)?\b)/g);
   return <>{tokens.map((token, i) => {
@@ -39,9 +39,9 @@ function Syntax({value, search}: {value: string; search: string}) {
     else if (/^(import|from|const|let|var|export|async|await|return|function|if|else|throw|new|class|interface|type|pub|fn|use|struct|impl|match|mod|for|in|while|try|catch|true|false|null|undefined|as)$/.test(token)) kind = 'syntax-keyword';
     return <span className={kind} key={i}>{marked(token, search)}</span>;
   })}</>;
-}
+});
 
-function CodeLine({line, side, search, onLine, commented, horizontal=0}: {
+const CodeLine=memo(function CodeLine({line, side, search, onLine, commented, horizontal=0}: {
   line?: DiffLine; side: 'before' | 'after'; search: string;
   onLine: Props['onLine']; commented: boolean; horizontal?: number;
 }) {
@@ -55,7 +55,7 @@ function CodeLine({line, side, search, onLine, commented, horizontal=0}: {
     <span className="line-sign" aria-hidden="true">{line.kind === 'add' ? '+' : line.kind === 'delete' ? '−' : ''}</span>
     <code><span className="code-line-text" style={horizontal?{transform:`translateX(-${horizontal}px)`}:undefined}>{line.changed ? line.changed.map((w, i)=><span key={i} className={w.changed ? 'word-change' : ''}><Syntax value={w.value} search={search}/></span>) : <Syntax value={line.text} search={search}/>}</span></code>
   </div>;
-}
+});
 
 const DiffView = forwardRef<DiffHandle, Props>(function DiffView({file, mode, preferences, search, comments, onLine, onCounts}, ref) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -66,6 +66,7 @@ const DiffView = forwardRef<DiffHandle, Props>(function DiffView({file, mode, pr
   const [horizontal,setHorizontal]=useState(0);
   const horizontalRefs=useRef<(HTMLDivElement|null)[]>([]);
   const cursor = useRef({hunk:-1,find:-1});
+  const commentedLines=useMemo(()=>new Set(comments.map(c=>`${c.side}:${c.line}`)),[comments]);
   const lines = useMemo(()=>linesFor(file.before, file.after), [file.before, file.after]);
   const allRows = useMemo(()=>splitRows(lines), [lines]);
   const split = preferences.layout === 'split' && mode === 'diff';
@@ -154,24 +155,24 @@ const DiffView = forwardRef<DiffHandle, Props>(function DiffView({file, mode, pr
     </button>;
     const common={search,onLine};
     if (split) return <div className="split-row" key={index} style={{minHeight:rowHeights[index]}} data-changed={row.changed || undefined}>
-      <CodeLine {...common} horizontal={preferences.wrap?0:horizontal} line={row.left} side="before" commented={comments.some(c=>c.side==='before' && c.line===row.left?.oldLine)}/>
-      <CodeLine {...common} horizontal={preferences.wrap?0:horizontal} line={row.right} side="after" commented={comments.some(c=>c.side==='after' && c.line===row.right?.newLine)}/>
+      <CodeLine {...common} horizontal={preferences.wrap?0:horizontal} line={row.left} side="before" commented={commentedLines.has(`before:${row.left?.oldLine}`)}/>
+      <CodeLine {...common} horizontal={preferences.wrap?0:horizontal} line={row.right} side="after" commented={commentedLines.has(`after:${row.right?.newLine}`)}/>
     </div>;
     // Full-file mode uses paired rows but preserves original deletions before replacements.
     if (mode==='file' && row.changed && row.left && row.right) return <div key={index} className="file-replacement">
-      <CodeLine {...common} line={row.left} side="before" commented={comments.some(c=>c.side==='before'&&c.line===row.left?.oldLine)}/>
-      <CodeLine {...common} line={row.right} side="after" commented={comments.some(c=>c.side==='after'&&c.line===row.right?.newLine)}/>
+      <CodeLine {...common} line={row.left} side="before" commented={commentedLines.has(`before:${row.left?.oldLine}`)}/>
+      <CodeLine {...common} line={row.right} side="after" commented={commentedLines.has(`after:${row.right?.newLine}`)}/>
     </div>;
     const line=row.right??row.left;
     return <div key={index} className="unified-row" style={{minHeight:rowHeights[index]}} data-changed={row.changed || undefined}>
       {mode==='diff' && <span className="old-number">{row.left?.oldLine??(line?.kind==='context'?line.oldLine:'')}</span>}
-      <CodeLine {...common} line={line} side={row.right?'after':'before'} commented={comments.some(c=>c.side===(row.right?'after':'before')&&c.line===(row.right?.newLine??row.left?.oldLine))}/>
+      <CodeLine {...common} line={line} side={row.right?'after':'before'} commented={commentedLines.has(`${row.right?'after':'before'}:${row.right?.newLine??row.left?.oldLine}`)}/>
     </div>;
   }
   return <div className={`diff-view ${split?'split':'unified'} ${preferences.wrap?'wrap':''}`}>
     {split && <div className="diff-column-headings"><span><span className="version-dot before"/>Original<span className="version-ref">base</span></span><span><span className="version-dot after"/>Modified<span className="version-ref">{mode==='diff'?'current':''}</span></span></div>}
     {search && !matches.length && <div className="find-empty"><SearchX size={14}/>No matching lines</div>}
-    <div ref={scrollRef} className="code-scroll" onScroll={e=>setScrollTop(e.currentTarget.scrollTop)} style={{'--code-size':`${preferences.fontSize/16}rem`} as React.CSSProperties}>
+    <div ref={scrollRef} className="code-scroll" onScroll={virtual?e=>setScrollTop(e.currentTarget.scrollTop):undefined} style={{'--code-size':`${preferences.fontSize/16}rem`} as React.CSSProperties}>
       <div className="code-rows" style={!split&&!preferences.wrap?{minWidth:Math.max(viewportWidth,longest*preferences.fontSize*.61+120)}:undefined}>
         {virtual && <div style={{height:offsets[start]}} aria-hidden="true"/>}
         {rows.slice(start,end).map((r,i)=>renderRow(r,start+i))}
@@ -184,4 +185,4 @@ const DiffView = forwardRef<DiffHandle, Props>(function DiffView({file, mode, pr
     }} aria-label={`Scroll ${i===0?'original':'modified'} code horizontally`} tabIndex={0}><div style={{width:Math.max(viewportWidth/2,longest*preferences.fontSize*.61+90),height:1}}/></div>)}</div>}
   </div>;
 });
-export default DiffView;
+export default memo(DiffView);

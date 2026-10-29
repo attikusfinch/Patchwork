@@ -40,11 +40,13 @@ export interface Comment {
 export type ReviewPriority = 'validate' | 'normal' | 'low';
 export interface ReviewPlanItem {
   priority: ReviewPriority;
+  order?: number;
+  summary?: string;
   reason: string;
   author: string;
   signature?: string;
 }
-export interface Review { reviewed: Record<string, string>; comments: Comment[]; plan: Record<string, ReviewPlanItem> }
+export interface Review { reviewed: Record<string, string>; comments: Comment[]; plan: Record<string, ReviewPlanItem>; summary?: string }
 export interface Connection {
   command: string;
   args: string[];

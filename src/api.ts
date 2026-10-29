@@ -21,8 +21,8 @@ export async function api<T>(method: string, params: Record<string, unknown> = {
     case 'get_file': case 'get_preview': result = demoFiles[String(params.path)]; break;
     case 'get_review': result = review; break;
     case 'set_review_plan': {
-      const entries=params.files as {path:string;priority:'validate'|'normal'|'low';reason?:string}[];
-      review={...review,plan:Object.fromEntries(entries.map(item=>[item.path,{priority:item.priority,reason:item.reason??'',author:'You'}]))};
+      const entries=params.files as {path:string;priority:'validate'|'normal'|'low';order?:number;summary?:string;reason?:string}[];
+      review={...review,summary:entries.length?String(params.summary??''):'',plan:Object.fromEntries(entries.map(item=>[item.path,{priority:item.priority,order:item.order,summary:item.summary,reason:item.reason??'',author:'You'}]))};
       reviews.set(base,review);result=review;break;
     }
     case 'set_reviewed': {

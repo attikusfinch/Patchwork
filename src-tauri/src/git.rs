@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use std::{collections::HashMap, fs, io::Read, path::{Component, Path, PathBuf}, process::Command};
+use std::{collections::{HashMap, HashSet}, fs, io::Read, path::{Component, Path, PathBuf}, process::Command};
 
 const MAX_FILE: u64 = 2 * 1024 * 1024;
 const MAX_IMAGE: u64 = 20 * 1024 * 1024;
@@ -137,6 +137,7 @@ pub fn snapshot(root: &Path, base: &str) -> Result<Snapshot, String> {
     args.extend([commit.as_str(), "--"]);
     let names = records(&run(root, &args)?);
     let staged = records(&run(root, &["diff", "--cached", "--name-only", "-z"])?);
+    let staged_paths: HashSet<_> = staged.iter().collect();
     let mut files = vec![];
     let mut i = 0;
     while i < names.len() {
@@ -152,7 +153,7 @@ pub fn snapshot(root: &Path, base: &str) -> Result<Snapshot, String> {
             i += 1;
             Some(old)
         } else { None };
-        files.push(ChangedFile { staged: staged.contains(&path), path, original_path,
+        files.push(ChangedFile { staged: staged_paths.contains(&path), path, original_path,
             status: status.to_string(), additions: 0, deletions: 0, binary: false, signature: String::new() });
     }
     let mut num_args = vec!["diff", "--no-ext-diff", "--no-textconv", "--find-renames", "--numstat", "-z"];
@@ -179,8 +180,9 @@ pub fn snapshot(root: &Path, base: &str) -> Result<Snapshot, String> {
         }
     }
     if base != "staged" {
+        let tracked_paths: HashSet<_> = files.iter().map(|f| f.path.clone()).collect();
         for path in records(&run(root, &["ls-files", "--others", "--exclude-standard", "-z"])? ) {
-            if files.iter().any(|f| f.path == path) { continue; }
+            if tracked_paths.contains(&path) { continue; }
             let content = read_working(root, &path)?;
             let binary = content.contains(&0) || std::str::from_utf8(&content).is_err();
             files.push(ChangedFile { path, original_path: None, status: "A".into(),
@@ -190,18 +192,15 @@ pub fn snapshot(root: &Path, base: &str) -> Result<Snapshot, String> {
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files.dedup_by(|a, b| a.path == b.path);
-    let index = records(&run(root, &["ls-files", "--stage", "-z"])?);
+    // Working-tree signatures use metadata; do not read the whole Git index for them.
+    let index = if base == "staged" { records(&run(root, &["ls-files", "--stage", "-z"])?) } else { vec![] };
     let index_ids: HashMap<_, _> = index.iter().filter_map(|record| {
         let (info, path) = record.split_once('\t')?;
         Some((path, info.split_whitespace().nth(1).unwrap_or("")))
     }).collect();
     for file in &mut files {
         let content_version = if base == "staged" { index_ids.get(file.path.as_str()).unwrap_or(&"").to_string() }
-        else {
-            fs::metadata(safe_path(root, &file.path)?).ok().map(|m| format!("{}:{}", m.len(),
-                m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0)))
-                .unwrap_or_else(|| "deleted".into())
-        };
+        else { working_version(root, &file.path)? };
         file.signature = format!("{}:{}:{}", commit, file.status, content_version);
     }
     let branch = text(root, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| "detached HEAD".into());
@@ -210,6 +209,12 @@ pub fn snapshot(root: &Path, base: &str) -> Result<Snapshot, String> {
     Ok(Snapshot { root: root.to_string_lossy().into_owned(),
         name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(),
         branch, branches, base: base.into(), base_commit: commit, files, staged_count: staged.len() })
+}
+
+fn working_version(root: &Path, path: &str) -> Result<String, String> {
+    Ok(fs::metadata(safe_path(root, path)?).ok().map(|m| format!("{}:{}", m.len(),
+        m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0)))
+        .unwrap_or_else(|| "deleted".into()))
 }
 
 fn read_working(root: &Path, path: &str) -> Result<Vec<u8>, String> {
@@ -269,24 +274,49 @@ fn image_side(bytes: &[u8], absent: bool) -> Option<ImageSide> {
 
 fn read_content(root: &Path, base: &str, path: &str, preview: bool) -> Result<FileContent, String> {
     safe_path(root, path)?;
-    let snap = snapshot(root, base)?;
-    let entry = snap.files.iter().find(|f| f.path == path);
-    let original = entry.and_then(|f| f.original_path.as_deref()).unwrap_or(path);
+    let commit = resolve_base(root, base)?;
+    // Preserve repository-wide rename detection, without numstat, branch enumeration,
+    // reading every untracked file or statting every changed file on each selection.
+    let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--find-renames", "--name-status", "-z"];
+    if base == "staged" { args.push("--cached"); }
+    args.extend([commit.as_str(), "--"]);
+    let names = records(&run(root, &args)?);
+    let mut original = path;
+    let mut status = "";
+    let mut i = 0;
+    while i + 1 < names.len() {
+        let kind = &names[i][..1];
+        let old = &names[i + 1];
+        let renamed = kind == "R" || kind == "C";
+        let destination = if renamed { names.get(i + 2).map(String::as_str) } else { Some(old.as_str()) };
+        if destination == Some(path) { original = old; status = kind; break; }
+        i += if renamed { 3 } else { 2 };
+    }
     let language = Path::new(path).extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
     let image = preview && ["png", "jpg", "jpeg", "webp"].contains(&language.as_str());
     let limit = if image { MAX_IMAGE } else { MAX_FILE };
-    let before = read_object(root, &format!("{}:{original}", snap.base_commit), limit)?;
+    let before = read_object(root, &format!("{commit}:{original}"), limit)?;
     let after = if base == "staged" { read_object(root, &format!(":{path}"), limit)? }
         else { read_working_limit(root, path, limit)? };
+    // An untracked file has no diff entry but still needs an added-file signature.
+    if status.is_empty() && base != "staged" && records(&run(root, &["ls-files", "--others", "--exclude-standard", "-z", "--", path])?).iter().any(|p| p == path) { status = "A"; }
+    let content_version = if base == "staged" {
+        let index = records(&run(root, &["ls-files", "--stage", "-z", "--", path])?);
+        index.iter().filter_map(|record| {
+            let (info, entry_path) = record.split_once('\t')?;
+            (entry_path == path).then(|| info.split_whitespace().nth(1).unwrap_or("").to_string())
+        }).last().unwrap_or_default()
+    } else { working_version(root, path)? };
+    let signature = if status.is_empty() { String::new() } else { format!("{commit}:{status}:{content_version}") };
     let images = image.then(|| ImageComparison {
-        before: image_side(&before, entry.is_some_and(|f| f.status == "A") || before.is_empty()),
-        after: image_side(&after, entry.is_some_and(|f| f.status == "D")),
+        before: image_side(&before, status == "A" || before.is_empty()),
+        after: image_side(&after, status == "D"),
     });
     let binary = image || before.contains(&0) || after.contains(&0)
         || std::str::from_utf8(&before).is_err() || std::str::from_utf8(&after).is_err();
     Ok(FileContent { path: path.into(), before: if binary { String::new() } else { String::from_utf8_lossy(&before).into_owned() },
         after: if binary { String::new() } else { String::from_utf8_lossy(&after).into_owned() }, binary,
-        language, signature: entry.map(|f| f.signature.clone()).unwrap_or_default(), images })
+        language, signature, images })
 }
 
 pub fn stage(root: &Path, path: &str, staged: bool) -> Result<(), String> {
@@ -403,6 +433,31 @@ mod tests {
         let staged = snapshot(&r.0, "staged").unwrap().files[0].signature.clone();
         r.write("a.txt", b"local-only change\n");
         assert_eq!(staged, snapshot(&r.0, "staged").unwrap().files[0].signature);
+    }
+    #[test]
+    fn targeted_previews_match_snapshot_signatures() {
+        let r = Repo::new();
+        r.write("old.txt", b"original content\n");
+        r.write("deleted.txt", b"deleted\n");
+        r.write("empty.txt", b"");
+        stage(&r.0, "old.txt", true).unwrap();
+        stage(&r.0, "deleted.txt", true).unwrap();
+        stage(&r.0, "empty.txt", true).unwrap();
+        commit(&r.0, "base").unwrap();
+        run(&r.0, &["checkout", "-b", "feature"]).unwrap();
+        run(&r.0, &["mv", "old.txt", "renamed.txt"]).unwrap();
+        fs::remove_file(r.0.join("deleted.txt")).unwrap();
+        r.write("untracked.txt", b"new content\n");
+        r.write("untracked-empty.txt", b"");
+        for base in ["working", "staged", "main"] {
+            let snap = snapshot(&r.0, base).unwrap();
+            for file in &snap.files {
+                let preview = file_content(&r.0, base, &file.path).unwrap();
+                assert_eq!(preview.signature, file.signature, "{base}: {}", file.path);
+                if file.path == "renamed.txt" { assert_eq!(preview.before, "original content\n"); }
+            }
+        }
+        assert!(file_content(&r.0, "working", "empty.txt").unwrap().signature.is_empty());
     }
     fn image_bytes(side: &Option<ImageSide>) -> Vec<u8> {
         let url = side.as_ref().unwrap().data_url.as_ref().unwrap();

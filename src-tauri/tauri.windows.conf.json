@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [{
+      "title": "Patchwork", "width": 1440, "height": 920,
+      "minWidth": 780, "minHeight": 540, "center": true,
+      "backgroundColor": "#171819", "decorations": false
+    }]
+  }
+}

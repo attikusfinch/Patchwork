@@ -7,7 +7,8 @@ A local diff viewer for Windows and macOS. Your agent writes the code; you revie
 ## Features
 
 - Changed-file explorer with `+N / −M` counts, filtering, tabs and a resizable sidebar. **Files** is the default view; **Folders / Files** switches between a folder tree and a flat list. The arrow next to **Changes** folds the entire section; the button beside the view switch folds all folders. The layout and section state are saved.
-- Agent-guided review queue: files needing validation come first, followed by ordinary changes and lower-priority files. Each suggestion shows its author and reason; files changed since the assessment are marked.
+- Agent-guided review order: numbered steps follow the execution flow across files, with Start / Previous / Next navigation. Priority is a compact icon, not a section. An overall flow summary and per-file explanations appear in the user's language beside the code. Each suggestion shows its author and validation checks; files changed since the assessment are marked. Numbered steps stay in sequence even in Folders view.
+- On Windows the app header is the draggable titlebar, with minimize, maximize / restore and close controls. Double-click its empty area or branding to maximize / restore. Appearance and keyboard shortcuts are in Settings; the left rail contains Files, Review and MCP.
 - Split and unified diffs, word-level change highlighting, expandable context, word wrap and search.
 - Full-file view with additions and deletions highlighted, including removed lines for context.
 - PNG, JPG/JPEG and WebP previews: original and modified images side by side or stacked, Full file view, transparency, dimensions and file size, Fit / 100%, and zoom from 25–400%.
@@ -76,25 +77,31 @@ Cursor uses `~/.cursor/mcp.json`; Claude Desktop uses `claude_desktop_config.jso
 | `show_diff` | Focuses the app and selects a file, line and view mode |
 | `get_review` | Reads priorities, reviewed markers and human comments |
 | `add_comment` | Adds a note to a file and line |
-| `set_review_plan` | Sets file-review priorities with reasons |
+| `set_review_plan` | Sets review order, priorities and reasons |
 
 Example instruction for your agent:
 
-> Open /path/to/repo in Patchwork. Compare it with main and use set_review_plan to mark the files I should validate and those with lower priority. Explain what to check. Show the most important file. After my review, read get_review and address the feedback.
+> Open /path/to/repo in Patchwork and compare with main. Read the code and use set_review_plan to explain the overall task and flow, then number every changed file in execution order: entry point, called functions, downstream effects, tests. Set priorities separately. For each file, explain what it does, its connection to the next step, and what to check. Write all summaries and reasons in my language. Use show_diff to open step 1. After my review, read get_review and address the feedback.
 
 Example `set_review_plan` arguments:
 
 ```json
 {
   "base": "main",
+  "summary": "The request enters the API handler, which checks authorization and calls the service to save the result.",
   "files": [
-    { "path": "src/api.ts", "priority": "validate", "reason": "Check authorization and server error handling." },
-    { "path": "README.md", "priority": "low", "reason": "Updated the getting-started instructions." }
+    { "path": "src/api.ts", "priority": "validate", "order": 1, "summary": "The handler validates the request and passes it to service.ts.", "reason": "Check authorization and invalid input handling." },
+    { "path": "src/service.ts", "priority": "normal", "order": 2, "summary": "The service saves the result and returns it to the handler.", "reason": "Check downstream effects and error propagation." },
+    { "path": "README.md", "priority": "low", "order": 3, "summary": "Documents how to start and use the new flow.", "reason": "Verify that the instructions match the code." }
   ]
 }
 ```
 
 Priorities are `validate`, `normal` and `low`. The list replaces the previous plan for this repository/comparison pair; files outside the plan keep normal priority. An empty `files` array clears the plan. Every listed file must be present in `list_changes` for the selected comparison. The plan contains agent suggestions; the human sets reviewed markers.
+
+`order` is optional: a unique integer from 1 to 1000. Numbered files come first, regardless of priority. Gaps are allowed; filtering or removing a file does not renumber the remaining steps. File paths must also be unique. Unnumbered files use priority sorting, with no priority section headings. Invalid plans are rejected as a whole. Existing saved reviews remain compatible. Restart the app and reconnect the agent after upgrading so it receives the updated MCP tool schema and instructions.
+
+Top-level `summary` describes the whole flow; each file's `summary` explains its role and changes (up to 12,000 UTF-8 bytes each). `reason` lists what the human should validate (up to 4,000 bytes). These fields contain plain text in the user's language, written by the connected agent after reading the code. They are optional for older clients; a new handoff should explain and number every changed file. Updating a plan replaces its summary as well; omitting it removes the old summary, and clearing the plan clears it too.
 
 The transport is [MCP stdio](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports). The internal bridge listens only on loopback, uses a random port and requires a local random token. This port is not a public MCP HTTP endpoint. MCP tools do not edit source files or create commits; Git writes are available through human actions in the UI.
 
@@ -109,6 +116,8 @@ node scripts/smoke-mcp.mjs
 ```
 
 The smoke test launches the real desktop app and MCP process. It checks the handshake, all eight tools, priorities and line counts, diff navigation, comments, persistence and file-access boundaries. It uses a separate test repository and data under `.qa/`.
+
+To measure file-read latency against a fixture with 501 changed files, run `node scripts/benchmark-mcp.mjs /path/to/patchwork`. Multiple executable arguments compare builds on the same fixture. The script reports ten warmed backend reads; it does not measure UI rendering, total memory or cold startup. `PATCHWORK_BENCHMARK_BRIDGE` can point to a common current executable when comparing older MCP transports.
 
 Build a Windows installer:
 

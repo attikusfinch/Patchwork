@@ -1,6 +1,7 @@
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useState } from 'react';
+import { forwardRef, memo, useEffect, useImperativeHandle, useMemo, useState } from 'react';
 import { ArrowDown, Check, ChevronDown, ChevronRight, FileCode2, FileJson2, FileText, Folder, FolderOpen, Image as ImageIcon, Minus, Plus, ShieldCheck } from 'lucide-react';
 import type { ChangedFile, ReviewPlanItem } from '../types';
+import { reviewOrder } from '../review';
 
 export function FileIcon({path,size=15}: {path:string;size?:number}) {
   if (/\.(png|jpe?g|webp)$/i.test(path)) return <ImageIcon size={size} className="file-icon text"/>;
@@ -29,19 +30,19 @@ function buildTree(files:ChangedFile[]):Node {
     }
     return root;
 }
-export default forwardRef<FileTreeHandle,Props>(function FileTree({files,selected,reviewed,plan,flat,filtering,onSelect,onStage,onCollapseChange},ref) {
+export default memo(forwardRef<FileTreeHandle,Props>(function FileTree({files,selected,reviewed,plan,flat,filtering,onSelect,onStage,onCollapseChange},ref) {
   const [collapsed,setCollapsed]=useState<Set<string>>(new Set());
   const groups=useMemo(()=>{
-    if(!files.some(file=>plan[file.path]))return [{key:'all',label:'',files,tree:buildTree(files)}];
+    if(!files.some(file=>plan[file.path]))return [{key:'all',label:'',files,tree:buildTree(flat?[]:files)}];
     return [
-      {key:'validate',label:'Needs validation'},
-      {key:'normal',label:'Other changes'},
-      {key:'low',label:'Lower priority'},
+      {key:'ordered',label:'Review order'},
+      {key:'other',label:files.some(file=>reviewOrder(plan[file.path])!==undefined)?'Other files':''},
     ].map(group=>{
-      const grouped=files.filter(f=>(plan[f.path]?.priority??'normal')===group.key);
-      return {...group,files:grouped,tree:buildTree(grouped)};
+      const grouped=files.filter(f=>group.key==='ordered'?reviewOrder(plan[f.path])!==undefined:
+        reviewOrder(plan[f.path])===undefined);
+      return {...group,files:grouped,tree:buildTree(flat||group.key==='ordered'?[]:grouped)};
     }).filter(group=>group.files.length);
-  },[files,plan]);
+  },[files,plan,flat]);
   const folderKeys=useMemo(()=>{
     const keys:string[]=[];
     function collect(node:Node,group:string) {
@@ -61,17 +62,24 @@ export default forwardRef<FileTreeHandle,Props>(function FileTree({files,selecte
     const name=file.path.split('/').at(-1)!;
     const directory=file.path.slice(0,-name.length-1);
     const item=plan[file.path];
+    const order=reviewOrder(item);
     const description=[file.originalPath?`${file.originalPath} → ${file.path}`:file.path,
-      item?.reason, file.binary?'Binary file':`${file.additions} lines added, ${file.deletions} removed`].filter(Boolean).join('\n');
-    return <div className={`file-row ${selected===file.path?'selected':''}`} key={file.path}>
+      order!==undefined?`Review step ${order}`:null,
+      item?.priority==='validate'?'Needs validation':item?.priority==='low'?'Lower priority':null,
+      item?.summary,item?.reason, file.binary?'Binary file':`${file.additions} lines added, ${file.deletions} removed`].filter(Boolean).join('\n');
+    return <div className={`file-row ${selected===file.path?'selected':''} ${item?.summary?'has-summary':''}`} key={file.path}>
       <button className="file-select" onClick={()=>onSelect(file.path)} style={{paddingLeft:12+depth*16}} aria-current={selected===file.path?'true':undefined} title={description}>
-        <FileIcon path={file.path}/><span className="file-name">{name}</span>
+        {order!==undefined&&<span className="review-order-number" aria-label={`Review step ${order}`}>{order}</span>}
+        {order===undefined&&<FileIcon path={file.path}/>}<span className="file-name">{name}</span>
+        {item?.priority==='validate'&&<ShieldCheck size={12} className="file-priority validate" aria-label="Needs validation"/>}
+        {item?.priority==='low'&&<ArrowDown size={12} className="file-priority" aria-label="Lower priority"/>}
         {flat&&directory&&<span className="file-directory">{directory}</span>}
         {reviewed[file.path]&&<Check size={12} className="reviewed-icon" aria-label="Reviewed"/>}
         <span className="file-line-stats" aria-label={file.binary?'Binary file':`${file.additions} lines added, ${file.deletions} removed`}>
           {file.binary?<span>bin</span>:<><span className="added-text">+{file.additions}</span><span className="deleted-text">−{file.deletions}</span></>}
         </span>
         <span className={`file-status status-${file.status}`} aria-label={{M:'Modified',A:'Added',D:'Deleted',R:'Renamed'}[file.status]??file.status}>{file.status}</span>
+        {item?.summary&&<span className="file-summary">{item.summary}</span>}
       </button>
       <button className={`file-stage ${file.staged?'is-staged':''}`} onClick={()=>onStage(file.path,!file.staged)} title={file.staged?'Unstage file':'Stage file'} aria-label={`${file.staged?'Unstage':'Stage'} ${name}`}>
         {file.staged?<Minus size={13}/>:<Plus size={13}/>}</button>
@@ -96,10 +104,9 @@ export default forwardRef<FileTreeHandle,Props>(function FileTree({files,selecte
     return <section key={group.key} aria-label={group.label||'Changed files'}>
       {group.label&&<button className={`review-group group-${group.key}`} onClick={()=>toggle(`group/${group.key}`)} aria-expanded={!closed}>
         {closed?<ChevronRight size={12}/>:<ChevronDown size={12}/>}
-        {group.key==='validate'?<ShieldCheck size={13}/>:group.key==='low'?<ArrowDown size={13}/>:null}
         <span>{group.label}</span><span className="group-count">{group.files.length}</span>
       </button>}
-      {!closed&&(flat?group.files.map(f=>fileRow(f,0,true)):nodes(group.tree,0,group.key))}
+      {!closed&&(flat||group.key==='ordered'?group.files.map(f=>fileRow(f,0,true)):nodes(group.tree,0,group.key))}
     </section>;
   })}</div>;
-});
+}));

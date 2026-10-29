@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { version } from '../package.json';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -6,6 +6,8 @@ import { ArrowDown, ArrowUp, Braces, Check, CheckCheck, ChevronDown, ChevronRigh
 import { api, desktop } from './api';
 import { demoReview, demoSnapshot, emptyReview } from './demo';
 import { fingerprint } from './diff';
+import { orderReviewFiles, reviewOrder } from './review';
+import WindowTitlebar from './components/WindowTitlebar';
 import DiffView from './components/DiffView';
 import ImagePreview from './components/ImagePreview';
 import type { DiffHandle } from './components/DiffView';
@@ -29,7 +31,6 @@ function validatedPreferences():Preferences {
 }
 const languages:Record<string,string>={ts:'TypeScript',tsx:'TypeScript React',js:'JavaScript',jsx:'JavaScript React',rs:'Rust',json:'JSON',md:'Markdown',py:'Python',css:'CSS',html:'HTML',toml:'TOML',yml:'YAML',yaml:'YAML'};
 const tools = ['open_repository','list_changes','get_diff','get_file','show_diff','get_review','add_comment','set_review_plan'];
-const priorityOrder={validate:0,normal:1,low:2};
 function contentFingerprint(file:FileContent) {return file.signature||fingerprint(file.images?.before?.dataUrl??file.before,file.images?.after?.dataUrl??file.after)}
 
 export default function App() {
@@ -108,7 +109,7 @@ export default function App() {
       setSnapshot(next);setReview(feedback);setRevision(v=>v+1);
       if(switched){setTabs([]);setSeenSignatures({});}
       const selection=!switched&&next.files.some(f=>f.path===selectedRef.current)?selectedRef.current:
-        next.files.find(f=>feedback.plan[f.path]?.priority==='validate')?.path??next.files[0]?.path??'';
+        orderReviewFiles(next.files,feedback.plan)[0]?.path??'';
       setSelected(selection);if(selection)setTabs(prev=>prev.includes(selection)?prev:[...prev,selection]);
       if(path){setRecent(prev=>{const items=[next.root,...prev.filter(p=>p!==next.root)].slice(0,8);save('patchwork.recent',items);return items;});setModal(null);}
     }catch(e){if(id===loadId.current)setError(String(e));}
@@ -135,7 +136,10 @@ export default function App() {
     const timer=setInterval(async()=>{
       if(document.hidden||inFlight||busyRef.current)return;inFlight=true;
       try {
-        const info=await api<Connection>('get_connection');if(active)setConnection(info);
+        const info=await api<Connection>('get_connection');
+        if(active)setConnection(previous=>previous&&previous.available===info.available&&previous.error===info.error
+          &&previous.command===info.command&&JSON.stringify(previous.args)===JSON.stringify(info.args)
+          &&JSON.stringify(previous.clients.map(({id,name,version})=>({id,name,version})))===JSON.stringify(info.clients.map(({id,name,version})=>({id,name,version})))?previous:info);
         if(snapshotRef.current){
           const next=await api<Snapshot>('get_snapshot',{base:baseRef.current});
           if(active&&JSON.stringify(next)!==JSON.stringify(snapshotRef.current))setSnapshot(next);
@@ -175,19 +179,21 @@ export default function App() {
     setBusy(true);setError('');
     try{await api(method,{...params,base:baseRef.current});await load();if(message)notify(message)}catch(e){setError(String(e))}finally{setBusy(false)}
   }
-  function stageFile(path:string,staged:boolean) {void mutate('stage_file',{path,staged},`${path.split('/').at(-1)} ${staged?'staged':'unstaged'}`)}
+  const stageFile=useCallback((path:string,staged:boolean)=>{void mutate('stage_file',{path,staged},`${path.split('/').at(-1)} ${staged?'staged':'unstaged'}`)},[load]);
   const current=snapshot?.files.find(f=>f.path===selected);
   const selectedPlan=review.plan[selected];
   const planStale=!!(selectedPlan?.signature&&current&&selectedPlan.signature!==current.signature);
-  const orderedFiles=[...(snapshot?.files??[])].sort((a,b)=>priorityOrder[review.plan[a.path]?.priority??'normal']-priorityOrder[review.plan[b.path]?.priority??'normal']);
+  const orderedFiles=useMemo(()=>orderReviewFiles(snapshot?.files??[],review.plan),[snapshot?.files,review.plan]);
+  const reviewSteps=useMemo(()=>orderedFiles.filter(f=>reviewOrder(review.plan[f.path])!==undefined),[orderedFiles,review.plan]);
+  const stepIndex=reviewSteps.findIndex(f=>f.path===selected);
   const planCount=orderedFiles.filter(f=>review.plan[f.path]).length;
   async function clearPlan() {
     try{setReview(await api<Review>('set_review_plan',{base:baseRef.current,files:[]}));notify('Agent review plan cleared');}
     catch(e){setError(String(e))}
   }
-  const validReviewed=Object.fromEntries(Object.entries(review.reviewed).filter(([path,hash])=>{
-    const entry=snapshot?.files.find(f=>f.path===path);return entry?.signature===hash || (!entry?.signature && seenSignatures[path]===hash);
-  }));
+  const validReviewed=useMemo(()=>Object.fromEntries((snapshot?.files??[]).filter(entry=>{
+    const hash=review.reviewed[entry.path];return hash&&(entry.signature===hash||(!entry.signature&&seenSignatures[entry.path]===hash));
+  }).map(entry=>[entry.path,review.reviewed[entry.path]])),[snapshot?.files,review.reviewed,seenSignatures]);
   const reviewedCount=snapshot?.files.filter(f=>validReviewed[f.path]).length??0;
   const isReviewed=!!(file&&review.reviewed[file.path]===(current?.signature??contentFingerprint(file)));
   const markReviewed=useCallback(async()=>{
@@ -195,7 +201,7 @@ export default function App() {
     try{const next=await api<Review>('set_reviewed',{path:selected,base:snapshot.base,reviewed:!isReviewed,fingerprint:current?.signature??contentFingerprint(file)});setReview(next);}
     catch(e){setError(String(e))}
   },[file,snapshot,selected,isReviewed,current?.signature]);
-  function commentAt(line:number,side:'before'|'after') {setCommentLine(line);setCommentSide(side);setReviewPanel(true);setTimeout(()=>commentInput.current?.focus(),40)}
+  const commentAt=useCallback((line:number,side:'before'|'after')=>{setCommentLine(line);setCommentSide(side);setReviewPanel(true);setTimeout(()=>commentInput.current?.focus(),40)},[]);
   async function addComment(e:React.FormEvent) {
     e.preventDefault();if(!commentBody.trim()||!selected)return;
     setBusy(true);
@@ -256,30 +262,27 @@ export default function App() {
     window.addEventListener('keydown',keydown);return ()=>window.removeEventListener('keydown',keydown);
   });
 
-  const visibleFiles=orderedFiles.filter(f=>f.path.toLowerCase().includes(filter.toLowerCase()));
+  const visibleFiles=useMemo(()=>orderedFiles.filter(f=>f.path.toLowerCase().includes(filter.toLowerCase())),[orderedFiles,filter]);
   const additions=snapshot?.files.reduce((n,f)=>n+f.additions,0)??0;
   const deletions=snapshot?.files.reduce((n,f)=>n+f.deletions,0)??0;
-  const selectedComments=review.comments.filter(c=>c.path===selected);
+  const selectedComments=useMemo(()=>review.comments.filter(c=>c.path===selected),[review.comments,selected]);
   const command=connection?.command??'patchwork';
   const configuration=agentType==='codex'?`[mcp_servers.patchwork]\ncommand = ${JSON.stringify(command)}\nargs = ["--mcp"]`:
     JSON.stringify({mcpServers:{patchwork:{command,args:['--mcp']}}},null,2);
 
   return <div className="app-shell">
-    <header className="titlebar">
+    <WindowTitlebar onError={setError}>
       <div className="brand"><img src="/logo.svg" alt="" width="27" height="27"/><span>patchwork<span className="brand-dot">.</span></span><span className="app-version">v{version}</span></div>
       <button className="workspace-switch" onClick={()=>void openRepository()} title="Open a repository"><FolderOpen size={14}/><span>{snapshot?.name??'Open workspace'}</span><ChevronDown size={12}/></button>
       <button className="command-trigger" onClick={()=>{setCommandQuery('');setModal('commands')}}><Search size={14}/><span>Find a file or run a command…</span><kbd>{mod} K</kbd></button>
       <div className="title-actions"><button className="connect-button" onClick={()=>setModal('agents')}><Plug size={14}/><span>{connection?.clients.length?`${connection.clients.length} agent${connection.clients.length===1?'':'s'}`:'Connect agent'}</span>{!!connection?.clients.length&&<span className="live-dot"/>}</button><button className="icon-button" title="Settings" aria-label="Settings" onClick={()=>setModal('settings')}><Settings2 size={16}/></button></div>
-    </header>
+    </WindowTitlebar>
 
     <div className="workspace">
       <nav className="activity-rail" aria-label="Workspace panels">
         <button className={sidebar?'active':''} title={`Files (${mod}+B)`} aria-label="Toggle file explorer" aria-pressed={sidebar} onClick={()=>setSidebar(v=>!v)}><Files size={21}/>{!!snapshot?.files.length&&<span className="activity-badge">{snapshot.files.length}</span>}</button>
         <button className={reviewPanel?'active':''} title="Review comments" aria-label="Toggle review comments" aria-pressed={reviewPanel} onClick={()=>setReviewPanel(v=>!v)}><MessageSquare size={20}/>{!!review.comments.length&&<span className="activity-badge">{review.comments.length}</span>}</button>
         <button className={modal==='agents'?'active':''} title="Agent connections" aria-label="Agent connections" onClick={()=>setModal('agents')}><Plug size={21}/></button>
-        <div className="rail-spacer"/>
-        <button title="Keyboard shortcuts" aria-label="Keyboard shortcuts" onClick={()=>{setSettingsTab('shortcuts');setModal('settings')}}><Keyboard size={20}/></button>
-        <button title="Appearance" aria-label="Appearance" onClick={()=>{setSettingsTab('appearance');setModal('settings')}}><Palette size={20}/></button>
       </nav>
 
       {sidebar&&<aside className="explorer" style={{width:prefs.sidebarWidth}}>
@@ -293,10 +296,12 @@ export default function App() {
           <div className="changes-view-bar"><div className="view-switch" role="group" aria-label="Changes layout">
             <button className={prefs.filesLayout==='tree'?'active':''} aria-pressed={prefs.filesLayout==='tree'} title="Group files into collapsible folders" onClick={()=>preference('filesLayout','tree')}><FolderTree size={13}/>Folders</button>
             <button className={prefs.filesLayout==='list'?'active':''} aria-pressed={prefs.filesLayout==='list'} title="Show files without folder rows" onClick={()=>preference('filesLayout','list')}><List size={13}/>Files</button>
-          </div>{prefs.filesLayout==='tree'&&<button className="icon-button" title={filter?'Clear the filter to fold folders':foldersCollapsed?'Expand all folders':'Collapse all folders'} aria-label={foldersCollapsed?'Expand all folders':'Collapse all folders'} disabled={!!filter||!visibleFiles.some(f=>f.path.includes('/'))} onClick={()=>foldersCollapsed?treeRef.current?.expandAll():treeRef.current?.collapseAll()}>
+          </div>{prefs.filesLayout==='tree'&&<button className="icon-button" title={filter?'Clear the filter to fold folders':foldersCollapsed?'Expand all folders':'Collapse all folders'} aria-label={foldersCollapsed?'Expand all folders':'Collapse all folders'} disabled={!!filter||!visibleFiles.some(f=>f.path.includes('/')&&reviewOrder(review.plan[f.path])===undefined)} onClick={()=>foldersCollapsed?treeRef.current?.expandAll():treeRef.current?.collapseAll()}>
             {foldersCollapsed?<ChevronsUpDown size={15}/>:<ChevronsDownUp size={15}/>}</button>}</div>
           <label className="file-filter"><Search size={13}/><input ref={fileFilter} value={filter} onChange={e=>setFilter(e.target.value)} placeholder="Filter changed files…" aria-label="Filter changed files"/><span>{mod} ⇧ F</span></label>
           {!!planCount&&<div className="agent-plan-label"><Plug size={12}/><span>Agent review plan</span><button className="icon-button" title="Clear agent review plan" aria-label="Clear agent review plan" onClick={()=>void clearPlan()}><X size={12}/></button></div>}
+          {review.summary&&<details className="review-overview" open><summary>Review overview</summary><p>{review.summary}</p></details>}
+          {!!reviewSteps.length&&<button className="start-review text-button" onClick={()=>{setFilter('');selectFile(reviewSteps[0].path)}}><List size={13}/>Start at step {review.plan[reviewSteps[0].path].order}<ChevronRight size={13}/></button>}
           <div className="tree-scroll"><FileTree ref={treeRef} files={visibleFiles} selected={selected} reviewed={validReviewed} plan={review.plan} flat={prefs.filesLayout==='list'} filtering={!!filter} onSelect={selectFile} onStage={stageFile} onCollapseChange={setFoldersCollapsed}/></div>
         </div>
         <div className="explorer-bottom">
@@ -348,13 +353,19 @@ export default function App() {
             <div className="toolbar-divider"/>
             <button className={`review-button ${isReviewed?'is-reviewed':''}`} disabled={!file||fileBusy} onClick={()=>void markReviewed()} title="Toggle reviewed (R)">{isReviewed?<CheckCheck size={14}/>:<Check size={14}/>}<span>{isReviewed?'Reviewed':'Mark reviewed'}</span></button>
           </div>
+          {!!reviewSteps.length&&<nav className="review-step-nav" aria-label="Review order">
+            <span><List size={14}/>{stepIndex>=0?`Review step ${selectedPlan.order} · ${stepIndex+1} of ${reviewSteps.length}`:`${reviewSteps.length} steps in the agent’s review order`}</span>
+            <div><button className="text-button" disabled={stepIndex<=0} title={stepIndex>0?reviewSteps[stepIndex-1].path:undefined} onClick={()=>selectFile(reviewSteps[stepIndex-1].path)}><ArrowUp size={13}/>Previous</button>
+              <button className="text-button" disabled={stepIndex===reviewSteps.length-1} title={reviewSteps[stepIndex+1]?.path} onClick={()=>selectFile(reviewSteps[stepIndex+1].path)}>{stepIndex<0?'Start review':'Next'}<ArrowDown size={13}/></button></div>
+          </nav>}
           {selectedPlan&&<div className={`review-priority-bar priority-${selectedPlan.priority}`}>
             <div>{selectedPlan.priority==='validate'?<ShieldCheck size={14}/>:selectedPlan.priority==='low'?<ArrowDown size={14}/>:<Plug size={14}/>}
               <strong>{selectedPlan.priority==='validate'?'Needs your validation':selectedPlan.priority==='low'?'Lower priority':'Review note'}</strong>
               <span>Suggested by {selectedPlan.author}</span>
               {planStale&&<span className="plan-stale">Changed since this assessment</span>}
             </div>
-            {selectedPlan.reason&&<p>{selectedPlan.reason}</p>}
+            {selectedPlan.summary&&<div className="file-explanation"><h3>What this file does</h3><p>{selectedPlan.summary}</p></div>}
+            {selectedPlan.reason&&<p><strong>What to check: </strong>{selectedPlan.reason}</p>}
           </div>}
           {findOpen&&!file?.binary&&<div className="find-bar"><Search size={14}/><input ref={findInput} autoFocus placeholder="Find in this file…" aria-label="Find in this file" value={search} onChange={e=>setSearch(e.target.value)} onKeyDown={e=>{if(e.key==='Enter')diffRef.current?.find(e.shiftKey?-1:1)}}/><span>{counts.matches} matching lines</span><button className="icon-button" aria-label="Previous match" onClick={()=>diffRef.current?.find(-1)}><ArrowUp size={14}/></button><button className="icon-button" aria-label="Next match" onClick={()=>diffRef.current?.find(1)}><ArrowDown size={14}/></button><button className="icon-button" aria-label="Close find" onClick={()=>{setFindOpen(false);setSearch('')}}><X size={14}/></button></div>}
           {fileBusy||(!!file&&file.path!==selected)?<div className="code-skeleton" aria-label="Loading file">{Array.from({length:16},(_,i)=><div key={i} style={{width:`${[44,62,38,75,56,30][i%6]}%`}}/>)}</div>:
@@ -407,7 +418,7 @@ export default function App() {
       <div className="agent-instruction"><span className="step-number">1</span><div><strong>Add Patchwork to your MCP configuration</strong><p>{agentType==='codex'?<>Append this to <code>~/.codex/config.toml</code>.</>:agentType==='cursor'?<>Merge this server into <code>~/.cursor/mcp.json</code>.</>:<>Merge this server into <code>claude_desktop_config.json</code>.</>}</p></div></div>
       <div className="configuration-block"><div><span>{agentType==='codex'?'config.toml':'MCP configuration'}</span><button className="text-button" onClick={()=>void copy(configuration,'MCP configuration copied')}><Copy size={13}/>Copy config</button></div><pre>{configuration}</pre></div>
       <div className="agent-instruction"><span className="step-number">2</span><div><strong>Restart the agent’s MCP connection</strong><p>Keep Patchwork open. The connected agent appears here after its handshake.</p></div></div>
-      <div className="agent-instruction"><span className="step-number">3</span><div><strong>Let the agent bring you to the change</strong><p>“Open this repository in Patchwork and show me the diff against main.”</p></div></div>
+      <div className="agent-instruction"><span className="step-number">3</span><div><strong>Ask for a guided review</strong><p>“Open this repository in Patchwork and compare with main. Use set_review_plan to explain the overall flow and number every changed file in execution order. For each file, summarize what it does, how it connects to the next step, and what I should check. Write all explanations in my language. Show me step 1.”</p></div></div>
       <details className="mcp-tools"><summary><Braces size={14}/>{tools.length} available tools<ChevronDown size={13}/></summary><div>{tools.map(tool=><code key={tool}>{tool}</code>)}</div></details>
       {connection?.clients.map(client=><div className="connected-agent" key={client.id}><span className="live-dot"/><strong>{client.name}</strong><span>{client.version}</span><small>Connected</small></div>)}
       <div className="agent-privacy"><ShieldCheck size={14}/><span>Agent tools read code and exchange review notes. Git writes happen through your controls in Patchwork.</span></div></div>

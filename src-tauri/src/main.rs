@@ -14,11 +14,16 @@ struct Review {
     reviewed: HashMap<String, String>,
     comments: Vec<Comment>,
     plan: HashMap<String, PlanItem>,
+    summary: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct PlanItem {
     priority: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    order: Option<u64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    summary: String,
     reason: String,
     author: String,
     signature: String,
@@ -104,10 +109,10 @@ fn dispatch(app: &tauri::AppHandle, state: &Shared, method: &str, params: &Value
             let path = string(params, "path")?;
             let content = git::file_content(&root, &base, path)?;
             if method == "get_diff" {
-                let snap = git::snapshot(&root, &base)?;
+                let commit = git::resolve_base(&root, &base)?;
                 let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames"];
                 if base == "staged" { args.push("--cached"); }
-                args.extend([snap.base_commit.as_str(), "--", path]);
+                args.extend([commit.as_str(), "--", path]);
                 let mut patch = String::from_utf8_lossy(&git::run(&root, &args)?).into_owned();
                 if patch.is_empty() && content.before.is_empty() && !content.after.is_empty() {
                     patch = format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@\n{}",
@@ -120,10 +125,17 @@ fn dispatch(app: &tauri::AppHandle, state: &Shared, method: &str, params: &Value
         "set_review_plan" => {
             let entries = params.get("files").and_then(Value::as_array).ok_or("files must be an array")?;
             if entries.len() > 1000 { return Err("A review plan can contain up to 1,000 files.".into()); }
+            let summary = match params.get("summary") {
+                None => "",
+                Some(value) => value.as_str().ok_or("Review summary must be a string.")?,
+            };
+            if summary.len() > 12000 { return Err("Review summary must be at most 12,000 bytes.".into()); }
             let snapshot = git::snapshot(&root, &base)?;
             let mut plan = HashMap::new();
+            let mut orders = std::collections::HashSet::new();
             for entry in entries {
                 let path = string(entry, "path")?;
+                if plan.contains_key(path) { return Err(format!("Duplicate file in review plan: {path}")); }
                 git::safe_path(&root, path)?;
                 let file = snapshot.files.iter().find(|f| f.path == path)
                     .ok_or_else(|| format!("{path} is not a changed file in this comparison."))?;
@@ -131,13 +143,28 @@ fn dispatch(app: &tauri::AppHandle, state: &Shared, method: &str, params: &Value
                 if !["validate", "normal", "low"].contains(&priority) {
                     return Err("Priority must be validate, normal, or low.".into());
                 }
+                let order = match entry.get("order") {
+                    None => None,
+                    Some(value) => {
+                        let number = value.as_u64().filter(|n| (1..=1000).contains(n))
+                            .ok_or("Review order must be an integer from 1 to 1,000.")?;
+                        if !orders.insert(number) { return Err(format!("Duplicate review order: {number}")); }
+                        Some(number)
+                    }
+                };
                 let reason = entry.get("reason").and_then(Value::as_str).unwrap_or("");
                 if reason.len() > 4000 { return Err("Review reasons must be at most 4,000 bytes.".into()); }
-                plan.insert(path.into(), PlanItem { priority: priority.into(), reason: reason.into(),
+                let file_summary = match entry.get("summary") {
+                    None => "",
+                    Some(value) => value.as_str().ok_or("File summary must be a string.")?,
+                };
+                if file_summary.len() > 12000 { return Err("File summary must be at most 12,000 bytes.".into()); }
+                plan.insert(path.into(), PlanItem { priority: priority.into(), order, summary: file_summary.into(), reason: reason.into(),
                     author: params.get("author").and_then(Value::as_str).unwrap_or("Agent").into(), signature: file.signature.clone() });
             }
             let review = ws.reviews.entry(key).or_default();
             review.plan = plan;
+            review.summary = if entries.is_empty() { String::new() } else { summary.into() };
             let result = json!(review);
             persist(&ws)?;
             let _ = app.emit("review-updated", ());
@@ -229,8 +256,18 @@ fn tools_list() -> Value {
         tool("get_diff", "Read a file's unified Git patch and before/after contents. Branch comparisons use the merge base and include local changes.", json!({"path":path,"base":base}), &["path"]),
         tool("get_file", "Read complete before/after file contents (2 MB limit) from the current comparison.", json!({"path":path,"base":base}), &["path"]),
         tool("show_diff", "Focus Patchwork and show a particular file, line and comparison for the human to review.", json!({"path":path,"base":base,"line":{"type":"integer","minimum":1},"mode":{"type":"string","enum":["diff","file"]}}), &[]),
-        tool("get_review", "Read review priorities, human comments and reviewed-file fingerprints. Use this to address feedback after a human reviews your changes.", json!({"base":base}), &[]),
-        tool("set_review_plan", "Replace the review plan for changed files. Mark files requiring human validation as validate, routine changes as normal, and less important files as low. Explain why in reason. Omitted files remain normal; an empty array clears the plan. Priorities are suggestions, not approval.", json!({"base":base,"files":{"type":"array","maxItems":1000,"items":{"type":"object","properties":{"path":path,"priority":{"type":"string","enum":["validate","normal","low"]},"reason":{"type":"string","description":"Concise explanation of what the human should check"}},"required":["path","priority"],"additionalProperties":false}}}), &["files"]),
+        tool("get_review", "Read the overall flow summary, per-file explanations, numbered review order, priorities, human comments and reviewed-file fingerprints. Use this to address feedback after a human reviews your changes.", json!({"base":base}), &[]),
+        tool("set_review_plan", "Replace the review plan. Write summary and reasons in the user's language (Russian for a Russian-speaking user). Explain the task and overall execution flow in the top-level summary. Include every changed file in a guided handoff: give each file a unique order, a summary explaining what changed, the functions involved and its connection to the next step, plus a reason describing what to check. Read the code first; do not invent behavior. Order is primary: entry point, called functions, downstream effects, tests. Priority is only a compact badge: validate for human validation, normal for routine changes, low for less important files. Numbered files appear first in ascending order. Paths and numbers must be unique; unnumbered files follow. Summary/order are optional for compatibility with older clients. An empty array clears the plan and summary. Suggestions are not approval.", json!({
+            "base":base,
+            "summary":{"type":"string","description":"In the user's language: task goal and end-to-end flow connecting the files. Up to 12,000 UTF-8 bytes."},
+            "files":{"type":"array","maxItems":1000,"items":{"type":"object","properties":{
+                "path":path,
+                "priority":{"type":"string","enum":["validate","normal","low"]},
+                "order":{"type":"integer","minimum":1,"maximum":1000,"description":"Unique review step, starting at 1. Follow execution flow, independently of priority. Gaps are allowed."},
+                "summary":{"type":"string","description":"In the user's language: what this file does or changes, key functions and how it connects to the next step. Displayed beside the code. Up to 12,000 UTF-8 bytes."},
+                "reason":{"type":"string","description":"In the user's language: specific checks, risks and assumptions for the human. Up to 4,000 UTF-8 bytes."}
+            },"required":["path","priority"],"additionalProperties":false}}
+        }), &["files"]),
         tool("add_comment", "Add a review note on a file and line. Does not change source code.", json!({"path":path,"base":base,"line":{"type":"integer","minimum":1},"side":{"type":"string","enum":["before","after"]},"body":{"type":"string"},"author":{"type":"string"}}), &["path","body"])
     ]})
 }
@@ -255,7 +292,7 @@ fn rpc(app: &tauri::AppHandle, state: &Shared, request: Value, session: &str) ->
             let requested = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2025-11-25");
             let version = if ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"].contains(&requested) { requested } else { "2025-11-25" };
             Ok(json!({"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"patchwork","version":env!("CARGO_PKG_VERSION")},
-                "instructions":"Use open_repository and list_changes, then set_review_plan to suggest files requiring human validation and lower-priority changes with reasons. Use show_diff to present changes. Read get_review to receive human feedback. All tools leave source files unchanged."}))
+                "instructions":"For a review handoff, use open_repository and list_changes, then read the code. Call set_review_plan with an overall summary of the task and execution flow, and include every changed file with a unique order (1, 2, 3...), a summary of what happens in that file and how it connects to the next step, a priority badge, and a reason explaining what to validate. Write all summaries and reasons in the user's language, such as Russian. Order follows the entry point, called functions, downstream effects and tests; priority does not change this sequence. Use show_diff to open step 1. Read get_review for human feedback. All tools leave source files unchanged."}))
         },
         "ping" | "notifications/initialized" | "notifications/cancelled" | "bridge/ping" => Ok(json!({})),
         "bridge/disconnect" => { if let Ok(mut ws) = state.lock() { ws.clients.remove(session); } Ok(json!({})) },
@@ -322,6 +359,9 @@ fn start_bridge(app: tauri::AppHandle, state: Shared) -> Result<(), String> {
                 Err(_) => Some(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}})),
             };
             let response = tiny_http::Response::from_string(response.map(|v| v.to_string()).unwrap_or_default())
+                // The bridge uses one JSON body per connection. Keep large replies
+                // length-delimited so existing stdio clients can read them too.
+                .with_chunked_threshold(usize::MAX)
                 .with_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap())
                 .with_header(tiny_http::Header::from_bytes("Connection", "close").unwrap());
             let _ = request.respond(response);
@@ -338,7 +378,9 @@ fn forward(value: &Value, session: &str) -> Result<Option<Value>, String> {
     socket.set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
     socket.set_write_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
     let body = value.to_string();
-    write!(socket, "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nX-Patchwork-Session: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", bridge.port, bridge.token, session, body.len(), body).map_err(|e| e.to_string())?;
+    // HTTP/1.0 forbids chunked transfer, including when this bridge connects to an
+    // older desktop build. Each request already opens and closes its own socket.
+    write!(socket, "POST /rpc HTTP/1.0\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nX-Patchwork-Session: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", bridge.port, bridge.token, session, body.len(), body).map_err(|e| e.to_string())?;
     let mut response = String::new();
     socket.take(16 * 1024 * 1024).read_to_string(&mut response).map_err(|e| e.to_string())?;
     let (headers, body) = response.split_once("\r\n\r\n").ok_or("Invalid bridge response")?;
@@ -391,4 +433,19 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("Could not start Patchwork");
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    #[test]
+    fn loads_legacy_review_plans_without_losing_feedback() {
+        let review: Review = serde_json::from_value(json!({
+            "reviewed":{"a.ts":"version"},"comments":[],
+            "plan":{"a.ts":{"priority":"validate","reason":"Check entry","author":"Agent","signature":"version"}}
+        })).unwrap();
+        assert_eq!(review.reviewed["a.ts"], "version");
+        assert_eq!(review.plan["a.ts"].order, None);
+        assert!(serde_json::to_value(&review).unwrap()["plan"]["a.ts"].get("order").is_none());
+    }
 }

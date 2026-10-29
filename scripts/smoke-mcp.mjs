@@ -57,27 +57,48 @@ try {
   client.stdin.write(JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized'})+'\n');
   const list=await call('tools/list');assert.equal(list.result.tools.length,8);
   assert.equal(list.result.tools.find(t=>t.name==='set_review_plan').annotations.readOnlyHint,false);
+  assert.equal(list.result.tools.find(t=>t.name==='set_review_plan').inputSchema.properties.files.items.properties.order.minimum,1);
   const opened=await tool('open_repository',{path:repository});assert.equal(opened.name,path.basename(repository));
   const changes=await tool('list_changes');assert.equal(changes.files.length,2);
   assert.equal(changes.files.find(f=>f.path==='hello.ts').additions,1);
   assert.equal(changes.files.find(f=>f.path==='hello.ts').deletions,1);
   assert.equal(changes.files.find(f=>f.path==='new file.txt').additions,1);
-  const plan=await tool('set_review_plan',{files:[
-    {path:'hello.ts',priority:'validate',reason:'Validate the greeting against the spec.'},
-    {path:'new file.txt',priority:'low',reason:'Documentation only.'},
+  const plan=await tool('set_review_plan',{summary:'Задача: изменить приветствие. Сначала читаем описание, затем проверяем реализацию.',files:[
+    {path:'hello.ts',priority:'validate',order:2,summary:'Меняет экспортируемое приветствие. Это реализация описания из шага 1.',reason:'Сверьте текст приветствия с описанием.'},
+    {path:'new file.txt',priority:'low',order:1,summary:'Описание изменения; после него переходим к hello.ts.',reason:'Начните с описания задачи.'},
   ]});
   assert.equal(plan.plan['hello.ts'].priority,'validate');
   assert.equal(plan.plan['hello.ts'].author,'Patchwork QA');
   assert.equal(plan.plan['hello.ts'].signature,changes.files.find(f=>f.path==='hello.ts').signature);
   assert.equal(plan.plan['new file.txt'].priority,'low');
+  assert.equal(plan.plan['new file.txt'].order,1);
+  assert.equal(plan.plan['hello.ts'].order,2);
+  assert.match(plan.summary,/Задача/);
+  assert.match(plan.plan['hello.ts'].summary,/приветствие/);
   for(const files of [
     [{path:'hello.ts',priority:'low'},{path:'missing.ts',priority:'validate'}],
     [{path:'hello.ts',priority:'wrong'}],
     [{path:'../data/bridge.json',priority:'low'}],
+    [{path:'hello.ts',priority:'normal',order:0}],
+    [{path:'hello.ts',priority:'normal',order:-1}],
+    [{path:'hello.ts',priority:'normal',order:1.5}],
+    [{path:'hello.ts',priority:'normal',order:'1'}],
+    [{path:'hello.ts',priority:'normal',order:null}],
+    [{path:'hello.ts',priority:'normal',order:1001}],
+    [{path:'hello.ts',priority:'normal',order:1},{path:'new file.txt',priority:'low',order:1}],
+    [{path:'hello.ts',priority:'normal',order:1},{path:'hello.ts',priority:'low',order:2}],
+    [{path:'hello.ts',priority:'normal',summary:42}],
+    [{path:'hello.ts',priority:'normal',summary:'я'.repeat(6001)}],
   ]) {
     const rejected=await call('tools/call',{name:'set_review_plan',arguments:{files}});
     assert.equal(rejected.result.isError,true);
     assert.deepEqual((await tool('get_review')).plan,plan.plan);
+    assert.equal((await tool('get_review')).summary,plan.summary);
+  }
+  for(const summary of [42,'я'.repeat(6001)]) {
+    const rejected=await call('tools/call',{name:'set_review_plan',arguments:{summary,files:[{path:'hello.ts',priority:'normal'}]}});
+    assert.equal(rejected.result.isError,true);
+    assert.equal((await tool('get_review')).summary,plan.summary);
   }
   await writeFile(path.join(repository,'hello.ts'),'export const greeting = "hello, reviewer";\n');
   const changed=await tool('list_changes');
@@ -100,11 +121,23 @@ try {
   const saved=JSON.parse(await readFile(path.join(data,'reviews.json'),'utf8'));
   assert.ok(Object.keys(saved).length>0);
   assert.deepEqual(Object.values(saved)[0].plan,plan.plan);
+  assert.equal(Object.values(saved)[0].summary,plan.summary);
+  // Large JSON replies must not expose HTTP chunk framing to the stdio client.
+  const large='export const message = "Привет";\n'.repeat(3000);
+  await writeFile(path.join(repository,'large.ts'),large);
+  assert.equal((await tool('get_file',{path:'large.ts'})).after,large);
   if(!process.argv.includes('--keep-open')) {
+    const legacy=await tool('set_review_plan',{files:[{path:'hello.ts',priority:'validate'}]});
+    assert.equal(legacy.plan['hello.ts'].order,undefined);
+    assert.equal(legacy.summary,'');
+    const partial=await tool('set_review_plan',{files:[{path:'hello.ts',priority:'normal',order:7},{path:'new file.txt',priority:'low'}]});
+    assert.equal(partial.plan['hello.ts'].order,7);
+    assert.equal(partial.plan['new file.txt'].order,undefined);
     assert.deepEqual((await tool('set_review_plan',{files:[]})).plan,{});
+    assert.equal((await tool('get_review')).summary,'');
     assert.equal((await tool('get_review')).comments.length,review.comments.length);
   }
-  console.log('MCP smoke passed: all 8 tools, line counts, priorities, validation, stale assessments, atomic plan updates, source reads, show_diff, comments and persistence.');
+  console.log('MCP smoke passed: all 8 tools, numbered order, legacy plans, invalid/duplicate steps, line counts, priorities, stale assessments, atomic plan updates, source reads, show_diff, comments and persistence.');
 }finally{
   client?.stdin.end();
   setTimeout(()=>client?.kill(),250).unref();

@@ -121,11 +121,18 @@ export function demoSnapshot(base = 'working'): Snapshot {
 export const emptyReview: Review = {reviewed:{},comments:[],plan:{}};
 export const demoReview: Review = {
   ...emptyReview,
+  summary:'Задача: дать агенту возможность открыть нужный diff и получить обратную связь. Сначала запрос проходит через MCP-сервер, затем передаёт контекст в окно ревью. Комментарии возвращаются агенту через get_review. После этой цепочки проверяем типы, регистрацию инструментов, тесты и запуск. Последние шаги — документация и образцы изображений.',
   plan: {
-    'src/mcp/server.ts': {priority:'validate',reason:'Validate input parsing, repository access and the new show_diff tool.',author:'Demo agent'},
-    'src/review/workspace.ts': {priority:'validate',reason:'Check that navigation opens the requested file and line, including when switching repositories.',author:'Demo agent'},
-    'src/review/comments.ts': {priority:'validate',reason:'Check comment persistence and repository boundaries before accepting the review flow.',author:'Demo agent'},
-    'src/types/review.ts': {priority:'low',reason:'Type definitions only; no runtime behavior changes.',author:'Demo agent'},
-    'README.md': {priority:'low',reason:'Documentation for the MCP review flow.',author:'Demo agent'},
+    'src/mcp/server.ts': {priority:'validate',order:1,summary:'Точка входа — showDiff. Функция проверяет path, base и line, получает репозиторий и передаёт контекст в openReview. Новый readFeedback возвращает комментарии агенту. Далее смотрим, как openReview открывает ревью.',reason:'Проверьте обработку некорректных аргументов и смену базы по умолчанию с HEAD на main.',author:'Demo agent'},
+    'src/review/workspace.ts': {priority:'validate',order:2,summary:'openReview теперь принимает не только путь, но и репозиторий, базу сравнения и строку. Контекст отправляется в событии review:open. После открытия файла человек оставляет комментарии — их хранение разбираем следующим шагом.',reason:'Убедитесь, что получатель слушает новое имя события и использует все поля контекста.',author:'Demo agent'},
+    'src/review/comments.ts': {priority:'validate',order:3,summary:'addComment складывает комментарии в Map по пути файла, getReviewComments собирает их в общий массив для агента. Хранилище находится только в памяти. Дальше проверяем структуру самого комментария.',reason:'Здесь нет сохранения на диск и разделения по репозиториям. Проверьте, допустимо ли это для задачи.',author:'Demo agent'},
+    'src/types/review.ts': {priority:'low',order:4,summary:'Описывает ReviewComment: файл, строка, сторона diff, текст и автор. ReviewState объединяет комментарии с отметками просмотренных файлов. Это контракт для предыдущего шага.',reason:'Сверьте обязательные поля с созданием и чтением комментариев.',author:'Demo agent'},
+    'src/mcp/tools.ts': {priority:'normal',order:5,summary:'Добавляет show_diff и get_review в список инструментов. Тип ToolName выводится из этого списка, чтобы имена инструментов оставались согласованными.',reason:'Сопоставьте список с обработчиками MCP-сервера.',author:'Demo agent'},
+    'tests/mcp.test.ts': {priority:'validate',order:6,summary:'Новый тест вызывает showDiff с файлом и строкой 24 и проверяет текст ответа. Так замыкается путь от MCP-запроса к подтверждению открытия ревью.',reason:'Тест проверяет ответ, но не фактический переход к строке. Оцените достаточность проверки.',author:'Demo agent'},
+    'package.json': {priority:'normal',order:7,summary:'Добавляет команду mcp для запуска сервера через tsx и поднимает версию примера до 0.2.0.',reason:'Проверьте наличие tsx и запуск команды.',author:'Demo agent'},
+    'README.md': {priority:'low',order:8,summary:'Описывает подключение агента и цикл show_diff → ревью человеком → get_review.',reason:'Сверьте описание локального хранения с реализацией comments.ts.',author:'Demo agent'},
+    'assets/preview.png': {priority:'low',order:9,summary:'Образец сравнения PNG: показывает исходное и изменённое изображение в демо.',reason:'Визуально сравните обе версии.',author:'Demo agent'},
+    'assets/preview.jpg': {priority:'low',order:10,summary:'Образец сравнения JPEG для проверки отображения фотографий.',reason:'Проверьте пропорции и качество предпросмотра.',author:'Demo agent'},
+    'assets/preview.webp': {priority:'low',order:11,summary:'Образец сравнения WebP завершает проверку поддерживаемых форматов изображений.',reason:'Проверьте отображение обеих версий.',author:'Demo agent'},
   },
 };
